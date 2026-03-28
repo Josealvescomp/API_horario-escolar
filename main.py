@@ -37,42 +37,67 @@ app.add_middleware(
 # ──────────────────────────────────────────────
 
 class Professor(BaseModel):
-    id: str
+    id: Union[str, int, float]
     nome: str
+
+    @field_validator('id', mode='before')
+    @classmethod
+    def coerce_id(cls, v):
+        return str(v)
 
 class Turma(BaseModel):
-    id: str
+    id: Union[str, int, float]
     nome: str
-    serie: str = ""
+    serie: Union[str, int, float] = ""
     turno: Optional[str] = "Integral"
 
+    @field_validator('id', 'serie', mode='before')
+    @classmethod
+    def coerce_str(cls, v):
+        return str(v) if v is not None else ""
+
 class Disciplina(BaseModel):
-    id: str
+    id: Union[str, int, float]
     nome: str
     abreviacao: Optional[str] = ""
 
+    @field_validator('id', mode='before')
+    @classmethod
+    def coerce_id(cls, v):
+        return str(v)
+
 class CargaHoraria(BaseModel):
-    id: str
-    turma_id: str
-    disciplina_id: str
-    professor_id: str
-    aulas_semana: Union[int, str]
+    id: Union[str, int, float]
+    turma_id: Union[str, int, float]
+    disciplina_id: Union[str, int, float]
+    professor_id: Union[str, int, float]
+    aulas_semana: Union[int, str, float]
     geminada: Optional[str] = "NAO"
+
+    @field_validator('id', 'turma_id', 'disciplina_id', 'professor_id', mode='before')
+    @classmethod
+    def coerce_str(cls, v):
+        return str(v) if v is not None else ""
 
     @field_validator('aulas_semana', mode='before')
     @classmethod
     def coerce_aulas(cls, v):
-        return int(v) if isinstance(v, str) else v
+        return int(float(v)) if v is not None else 0
 
 class Indisponibilidade(BaseModel):
-    professor_id: str
+    professor_id: Union[str, int, float]
     dia: str
-    slot: Union[int, str]
+    slot: Union[int, str, float]
+
+    @field_validator('professor_id', mode='before')
+    @classmethod
+    def coerce_str(cls, v):
+        return str(v) if v is not None else ""
 
     @field_validator('slot', mode='before')
     @classmethod
     def coerce_slot(cls, v):
-        return int(v) if isinstance(v, str) else v
+        return int(float(v)) if v is not None else 0
 
 class InputData(BaseModel):
     professores: list[Professor]
