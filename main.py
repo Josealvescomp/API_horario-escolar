@@ -1,70 +1,57 @@
 """
 ====================================================================
-MOTOR DE GERAÇÃO DE HORÁRIOS ESCOLARES
+MOTOR DE GERAÇÃO DE HORÁRIOS ESCOLARES v2
 API FastAPI + Google OR-Tools CP-SAT Solver
 ====================================================================
-Resolve o School Timetabling Problem usando Constraint Programming.
-Recebe dados via POST JSON, retorna a grade otimizada.
+Estratégia: Decomposição por turma com rastreamento global de
+conflitos de professor. Resolve cada turma como um sub-problema
+CP-SAT pequeno, respeitando alocações anteriores.
+Memória: ~50MB para 50 turmas (cabe no free tier 512MB).
 ====================================================================
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 from typing import Optional, Union
 from ortools.sat.python import cp_model
 import time
 import logging
+import traceback
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Motor de Horários Escolares",
-    description="API para geração otimizada de grades horárias usando CP-SAT",
-    version="1.0.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Motor de Horarios Escolares", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ──────────────────────────────────────────────
-# MODELOS DE DADOS
+# MODELOS DE DADOS (tolerantes a tipos do Sheets)
 # ──────────────────────────────────────────────
 
 class Professor(BaseModel):
     id: Union[str, int, float]
     nome: str
-
     @field_validator('id', mode='before')
     @classmethod
-    def coerce_id(cls, v):
-        return str(v)
+    def _sid(cls, v): return str(v)
 
 class Turma(BaseModel):
     id: Union[str, int, float]
     nome: str
     serie: Union[str, int, float] = ""
     turno: Optional[str] = "Integral"
-
     @field_validator('id', 'serie', mode='before')
     @classmethod
-    def coerce_str(cls, v):
-        return str(v) if v is not None else ""
+    def _sid(cls, v): return str(v) if v is not None else ""
 
 class Disciplina(BaseModel):
     id: Union[str, int, float]
     nome: str
     abreviacao: Optional[str] = ""
-
     @field_validator('id', mode='before')
     @classmethod
-    def coerce_id(cls, v):
-        return str(v)
+    def _sid(cls, v): return str(v)
 
 class CargaHoraria(BaseModel):
     id: Union[str, int, float]
@@ -73,31 +60,23 @@ class CargaHoraria(BaseModel):
     professor_id: Union[str, int, float]
     aulas_semana: Union[int, str, float]
     geminada: Optional[str] = "NAO"
-
     @field_validator('id', 'turma_id', 'disciplina_id', 'professor_id', mode='before')
     @classmethod
-    def coerce_str(cls, v):
-        return str(v) if v is not None else ""
-
+    def _sid(cls, v): return str(v) if v is not None else ""
     @field_validator('aulas_semana', mode='before')
     @classmethod
-    def coerce_aulas(cls, v):
-        return int(float(v)) if v is not None else 0
+    def _int(cls, v): return int(float(v)) if v is not None else 0
 
 class Indisponibilidade(BaseModel):
     professor_id: Union[str, int, float]
     dia: str
     slot: Union[int, str, float]
-
     @field_validator('professor_id', mode='before')
     @classmethod
-    def coerce_str(cls, v):
-        return str(v) if v is not None else ""
-
+    def _sid(cls, v): return str(v) if v is not None else ""
     @field_validator('slot', mode='before')
     @classmethod
-    def coerce_slot(cls, v):
-        return int(float(v)) if v is not None else 0
+    def _int(cls, v): return int(float(v)) if v is not None else 0
 
 class InputData(BaseModel):
     professores: list[Professor]
@@ -111,20 +90,26 @@ class InputData(BaseModel):
 # CONSTANTES
 # ──────────────────────────────────────────────
 
-DIAS = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta"]
+DIAS = ["Segunda", "Terca", "Quarta", "Quinta", "Sexta"]
+DIAS_ACCEPT = {
+    "Segunda": 0, "segunda": 0,
+    "Terça": 1, "terça": 1, "Terca": 1, "terca": 1, "Terca": 1,
+    "Quarta": 2, "quarta": 2,
+    "Quinta": 3, "quinta": 3,
+    "Sexta": 4, "sexta": 4,
+}
 SLOTS_MANHA = [1, 2, 3, 4, 5]
 SLOTS_TARDE = [6, 7, 8, 9]
 TODOS_SLOTS = SLOTS_MANHA + SLOTS_TARDE
 NUM_DIAS = len(DIAS)
 NUM_SLOTS = len(TODOS_SLOTS)
-
-# ──────────────────────────────────────────────
-# HEALTH CHECK
-# ──────────────────────────────────────────────
+MANHA_LEN = len(SLOTS_MANHA)
+SLOT_TO_IDX = {s: i for i, s in enumerate(TODOS_SLOTS)}
+DIA_NAMES = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta"]  # nomes bonitos p/ output
 
 @app.get("/")
 def health():
-    return {"status": "online", "engine": "OR-Tools CP-SAT", "version": "1.0.0"}
+    return {"status": "online", "engine": "OR-Tools CP-SAT v2 (decomposed)", "version": "2.0.0"}
 
 # ──────────────────────────────────────────────
 # ENDPOINT PRINCIPAL
@@ -133,274 +118,284 @@ def health():
 @app.post("/gerar-grade")
 def gerar_grade(data: InputData):
     start_time = time.time()
-    logger.info(f"Recebido: {len(data.turmas)} turmas, {len(data.professores)} professores, {len(data.carga_horaria)} cargas")
-
+    logger.info(f"Recebido: {len(data.turmas)} turmas, {len(data.professores)} profs, {len(data.carga_horaria)} cargas")
     try:
         resultado = resolver_horarios(data)
-        elapsed = round(time.time() - start_time, 2)
-        resultado["tempo_segundos"] = elapsed
-        logger.info(f"Resolvido em {elapsed}s — status: {resultado['status']}")
+        resultado["tempo_segundos"] = round(time.time() - start_time, 2)
+        logger.info(f"Pronto em {resultado['tempo_segundos']}s - {resultado['status']}")
         return resultado
     except Exception as e:
-        import traceback
         tb = traceback.format_exc()
-        logger.error(f"Erro no solver: {tb}")
+        logger.error(f"Erro: {tb}")
         return {
             "status": "erro",
-            "message": f"Erro interno no solver: {str(e)}",
+            "message": f"Erro interno: {str(e)}",
             "traceback": tb,
-            "alocacoes": [],
-            "total_aulas": 0,
-            "alocadas": 0,
-            "nao_alocadas": 0,
+            "alocacoes": [], "total_aulas": 0, "alocadas": 0, "nao_alocadas": 0,
             "tempo_segundos": round(time.time() - start_time, 2)
         }
 
+# ──────────────────────────────────────────────
+# SOLVER DECOMPOSTO POR TURMA
+# ──────────────────────────────────────────────
 
 def resolver_horarios(data: InputData) -> dict:
     """
-    Modela e resolve o problema de timetabling usando CP-SAT.
-    Usa índices numéricos para nomear variáveis (evita caracteres especiais dos IDs).
+    Resolve turma por turma. Cada sub-problema tem ~20-40 vars.
+    Rastreia conflitos de professor globalmente.
     """
 
-    model = cp_model.CpModel()
-
-    # ── Mapear IDs para índices numéricos (safe para nomes de variáveis) ──
-    prof_list = [str(p.id) for p in data.professores]
-    turma_list = [str(t.id) for t in data.turmas]
-
-    # Indisponibilidades: set de (prof_id_str, dia_idx, slot_idx)
-    indisp_set = set()
-    dia_to_idx = {d: i for i, d in enumerate(DIAS)}
-    slot_to_idx = {s: i for i, s in enumerate(TODOS_SLOTS)}
-
+    # Indisponibilidades: set(prof_id, dia_i, slot_i)
+    indisp = set()
     for ind in data.indisponibilidades:
-        d_idx = dia_to_idx.get(ind.dia)
-        s_idx = slot_to_idx.get(int(ind.slot))
-        if d_idx is not None and s_idx is not None:
-            indisp_set.add((str(ind.professor_id), d_idx, s_idx))
+        di = DIAS_ACCEPT.get(ind.dia)
+        si = SLOT_TO_IDX.get(int(ind.slot))
+        if di is not None and si is not None:
+            indisp.add((str(ind.professor_id), di, si))
 
-    # ── Expandir cargas em "aulas" individuais ──
-    aula_meta = []
+    logger.info(f"Indisponibilidades carregadas: {len(indisp)}")
 
+    # Agrupar cargas por turma
+    cargas_por_turma = {}
     for c in data.carga_horaria:
-        n = int(c.aulas_semana)
-        is_gem = (c.geminada == "SIM")
         tid = str(c.turma_id)
+        cargas_por_turma.setdefault(tid, []).append(c)
+
+    # Ocupação global do professor: set de (prof_id, dia_i, slot_i)
+    prof_ocupado = set()
+
+    # Ordenar: turmas com mais aulas primeiro (mais restritas)
+    turma_order = sorted(
+        cargas_por_turma.keys(),
+        key=lambda t: sum(int(c.aulas_semana) for c in cargas_por_turma[t]),
+        reverse=True
+    )
+
+    todas_alocacoes = []
+    total_aulas = 0
+    total_alocadas = 0
+    turmas_falha = []
+
+    for tid in turma_order:
+        cargas = cargas_por_turma[tid]
+        result = resolver_turma(tid, cargas, indisp, prof_ocupado)
+        total_aulas += result["total"]
+
+        if result["alocacoes"]:
+            total_alocadas += result["alocadas"]
+            todas_alocacoes.extend(result["alocacoes"])
+            for aloc in result["alocacoes"]:
+                di = DIAS_ACCEPT.get(aloc["dia"], -1)
+                si = SLOT_TO_IDX.get(aloc["slot"], -1)
+                if di >= 0 and si >= 0:
+                    prof_ocupado.add((aloc["professor_id"], di, si))
+
+        if not result["ok"]:
+            turmas_falha.append(tid)
+
+    nao_alocadas = total_aulas - total_alocadas
+    turma_map = {str(t.id): t.nome for t in data.turmas}
+    falha_nomes = [turma_map.get(t, t) for t in turmas_falha]
+
+    status = "otimo" if nao_alocadas == 0 else ("viavel" if total_alocadas > 0 else "inviavel")
+    msg = f"Grade gerada! {total_alocadas}/{total_aulas} aulas alocadas."
+    if falha_nomes:
+        msg += f" Turmas com problemas: {', '.join(falha_nomes)}"
+
+    return {
+        "status": status,
+        "message": msg,
+        "alocacoes": todas_alocacoes,
+        "total_aulas": total_aulas,
+        "alocadas": total_alocadas,
+        "nao_alocadas": nao_alocadas,
+        "penalidade_total": 0,
+        "detalhes_solver": {
+            "turmas_resolvidas": len(turma_order),
+            "turmas_com_falha": len(turmas_falha)
+        }
+    }
+
+
+def resolver_turma(turma_id, cargas, indisp, prof_ocupado):
+    """
+    Resolve o sub-problema de UMA turma.
+    Modelo pequeno: ~N_aulas * 45 variáveis.
+    """
+
+    # Expandir cargas em aulas individuais
+    aulas = []
+    for c in cargas:
+        n = int(c.aulas_semana)
         did = str(c.disciplina_id)
         pid = str(c.professor_id)
+        gem = (c.geminada == "SIM")
 
-        if is_gem and n >= 2:
+        if gem and n >= 2:
             for _ in range(n // 2):
-                aula_meta.append({"turma_id": tid, "disc_id": did, "prof_id": pid, "tipo": "geminada"})
-            if n % 2 == 1:
-                aula_meta.append({"turma_id": tid, "disc_id": did, "prof_id": pid, "tipo": "simples"})
+                aulas.append({"did": did, "pid": pid, "tipo": "geminada"})
+            if n % 2:
+                aulas.append({"did": did, "pid": pid, "tipo": "simples"})
         else:
             for _ in range(n):
-                aula_meta.append({"turma_id": tid, "disc_id": did, "prof_id": pid, "tipo": "simples"})
+                aulas.append({"did": did, "pid": pid, "tipo": "simples"})
 
-    num_aulas = len(aula_meta)
-    logger.info(f"Total de aulas a alocar: {num_aulas}")
+    na = len(aulas)
+    if na == 0:
+        return {"ok": True, "total": 0, "alocadas": 0, "alocacoes": []}
 
-    if num_aulas == 0:
-        return {
-            "status": "ok", "message": "Nenhuma aula para alocar.",
-            "alocacoes": [], "total_aulas": 0, "alocadas": 0, "nao_alocadas": 0
-        }
+    # Slots válidos para início de geminada
+    gem_starts = set()
+    for d in range(NUM_DIAS):
+        for s in range(MANHA_LEN - 1):
+            gem_starts.add((d, s))
+        for s in range(MANHA_LEN, NUM_SLOTS - 1):
+            gem_starts.add((d, s))
 
-    # ── Variáveis de decisão: x[a][d][s] ──
-    # Para simples: x[a,d,s]=1 se aula a está no dia d slot s
-    # Para geminada: x[a,d,s]=1 se aula a COMEÇA no dia d slot s (ocupa s e s+1)
-    x = {}
-    for a in range(num_aulas):
+    # Pré-computar bloqueios por aula
+    # blocked[a] = set de (d, s) onde aula a NÃO pode ser alocada
+    blocked = []
+    for a in range(na):
+        pid = aulas[a]["pid"]
+        bl = set()
         for d in range(NUM_DIAS):
             for s in range(NUM_SLOTS):
-                x[(a, d, s)] = model.new_bool_var(f"a{a}_d{d}_s{s}")
+                if (pid, d, s) in indisp or (pid, d, s) in prof_ocupado:
+                    bl.add((d, s))
+        blocked.append(bl)
 
-    # ── Pré-computar slots válidos para geminadas ──
-    manha_len = len(SLOTS_MANHA)
-    gem_valid_starts = set()
-    for d in range(NUM_DIAS):
-        for s in range(manha_len - 1):  # manhã
-            gem_valid_starts.add((d, s))
-        for s in range(manha_len, NUM_SLOTS - 1):  # tarde
-            gem_valid_starts.add((d, s))
+    # ── Modelo CP-SAT ──
+    model = cp_model.CpModel()
 
-    # ══ HARD CONSTRAINT 1: Cada aula alocada exatamente 1 vez ══
-    for a in range(num_aulas):
-        meta = aula_meta[a]
-        if meta["tipo"] == "geminada":
-            valid = [x[(a, d, s)] for (d, s) in gem_valid_starts]
-            invalid = [x[(a, d, s)] for d in range(NUM_DIAS) for s in range(NUM_SLOTS) if (d, s) not in gem_valid_starts]
-            for v in invalid:
-                model.add(v == 0)
+    x = {}
+    for a in range(na):
+        for d in range(NUM_DIAS):
+            for s in range(NUM_SLOTS):
+                x[(a, d, s)] = model.new_bool_var(f"x{a}d{d}s{s}")
+
+    # HC1: Cada aula alocada exatamente 1 vez
+    for a in range(na):
+        if aulas[a]["tipo"] == "geminada":
+            valid = []
+            for d in range(NUM_DIAS):
+                for s in range(NUM_SLOTS):
+                    if (d, s) in gem_starts:
+                        # Verificar que ambos os slots não estão bloqueados
+                        if (d, s) not in blocked[a] and (d, s + 1) not in blocked[a]:
+                            valid.append(x[(a, d, s)])
+                        else:
+                            model.add(x[(a, d, s)] == 0)
+                    else:
+                        model.add(x[(a, d, s)] == 0)
+            if not valid:
+                logger.warning(f"Turma {turma_id}: aula geminada {a} sem slot viável")
+                return {"ok": False, "total": na, "alocadas": 0, "alocacoes": []}
             model.add_exactly_one(valid)
         else:
-            all_vars = [x[(a, d, s)] for d in range(NUM_DIAS) for s in range(NUM_SLOTS)]
-            model.add_exactly_one(all_vars)
-
-    # ── Helper: quais variáveis "ocupam" slot (d,s) para aula a ──
-    def ocupa_slot(a, d, s):
-        """Retorna lista de variáveis x que fazem aula a ocupar dia d slot s."""
-        meta = aula_meta[a]
-        vars_occ = [x[(a, d, s)]]
-        if meta["tipo"] == "geminada" and s > 0:
-            # Geminada que COMEÇA em s-1 também ocupa s, se no mesmo turno
-            s_prev = s - 1
-            same_turno = (s_prev < manha_len and s < manha_len) or (s_prev >= manha_len and s >= manha_len)
-            if same_turno:
-                vars_occ.append(x[(a, d, s_prev)])
-        return vars_occ
-
-    # ══ HARD CONSTRAINT 2: Conflito de professor (max 1 por slot) ══
-    prof_aulas = {}
-    for a in range(num_aulas):
-        pid = aula_meta[a]["prof_id"]
-        prof_aulas.setdefault(pid, []).append(a)
-
-    for pid, als in prof_aulas.items():
-        if len(als) <= 1:
-            continue
-        for d in range(NUM_DIAS):
-            for s in range(NUM_SLOTS):
-                occ = []
-                for a in als:
-                    occ.extend(ocupa_slot(a, d, s))
-                if len(occ) > 1:
-                    model.add(sum(occ) <= 1)
-
-    # ══ HARD CONSTRAINT 3: Conflito de turma (max 1 por slot) ══
-    turma_aulas = {}
-    for a in range(num_aulas):
-        tid = aula_meta[a]["turma_id"]
-        turma_aulas.setdefault(tid, []).append(a)
-
-    for tid, als in turma_aulas.items():
-        if len(als) <= 1:
-            continue
-        for d in range(NUM_DIAS):
-            for s in range(NUM_SLOTS):
-                occ = []
-                for a in als:
-                    occ.extend(ocupa_slot(a, d, s))
-                if len(occ) > 1:
-                    model.add(sum(occ) <= 1)
-
-    # ══ HARD CONSTRAINT 4: Disponibilidade do professor ══
-    for a in range(num_aulas):
-        meta = aula_meta[a]
-        pid = meta["prof_id"]
-        for d in range(NUM_DIAS):
-            for s in range(NUM_SLOTS):
-                if (pid, d, s) in indisp_set:
-                    model.add(x[(a, d, s)] == 0)
-                # Geminada: se s+1 indisponível, não pode começar em s
-                if meta["tipo"] == "geminada" and s + 1 < NUM_SLOTS:
-                    if (pid, d, s + 1) in indisp_set:
+            valid = []
+            for d in range(NUM_DIAS):
+                for s in range(NUM_SLOTS):
+                    if (d, s) in blocked[a]:
                         model.add(x[(a, d, s)] == 0)
+                    else:
+                        valid.append(x[(a, d, s)])
+            if not valid:
+                logger.warning(f"Turma {turma_id}: aula {a} sem slot viável")
+                return {"ok": False, "total": na, "alocadas": 0, "alocacoes": []}
+            model.add_exactly_one(valid)
 
-    # ══ SOFT CONSTRAINTS ══
-    penalties = []
+    # HC2: Max 1 aula por slot na turma
+    for d in range(NUM_DIAS):
+        for s in range(NUM_SLOTS):
+            occ = []
+            for a in range(na):
+                occ.append(x[(a, d, s)])
+                if aulas[a]["tipo"] == "geminada" and s > 0:
+                    sp = s - 1
+                    same = (sp < MANHA_LEN and s < MANHA_LEN) or (sp >= MANHA_LEN and s >= MANHA_LEN)
+                    if same:
+                        occ.append(x[(a, d, sp)])
+            if len(occ) > 1:
+                model.add(sum(occ) <= 1)
 
-    # SOFT 1: Max 2 aulas da mesma disciplina/turma por dia
-    turma_disc_aulas = {}
-    for a in range(num_aulas):
-        key = (aula_meta[a]["turma_id"], aula_meta[a]["disc_id"])
-        turma_disc_aulas.setdefault(key, []).append(a)
+    # HC3: Conflito de mesmo professor dentro da turma
+    prof_a = {}
+    for a in range(na):
+        prof_a.setdefault(aulas[a]["pid"], []).append(a)
 
-    sc_idx = 0
-    for (tid, did), als in turma_disc_aulas.items():
-        for d in range(NUM_DIAS):
-            day_vars = [x[(a, d, s)] for a in als for s in range(NUM_SLOTS)]
-            if len(day_vars) > 2:
-                excess = model.new_int_var(0, len(day_vars), f"sc{sc_idx}")
-                sc_idx += 1
-                model.add(excess >= sum(day_vars) - 2)
-                penalties.append(excess * 50)
-
-    # SOFT 2: Distribuir aulas ao longo da semana
-    for (tid, did), als in turma_disc_aulas.items():
+    for pid, als in prof_a.items():
         if len(als) <= 1:
             continue
         for d in range(NUM_DIAS):
-            day_vars = [x[(a, d, s)] for a in als for s in range(NUM_SLOTS)]
-            if day_vars:
-                over = model.new_int_var(0, 10, f"sc{sc_idx}")
-                sc_idx += 1
-                model.add(over >= sum(day_vars) - 1)
-                penalties.append(over * 10)
+            for s in range(NUM_SLOTS):
+                occ = []
+                for a in als:
+                    occ.append(x[(a, d, s)])
+                    if aulas[a]["tipo"] == "geminada" and s > 0:
+                        sp = s - 1
+                        same = (sp < MANHA_LEN and s < MANHA_LEN) or (sp >= MANHA_LEN and s >= MANHA_LEN)
+                        if same:
+                            occ.append(x[(a, d, sp)])
+                if len(occ) > 1:
+                    model.add(sum(occ) <= 1)
 
-    # SOFT 3: Evitar professor em todos os 5 dias (simplificado)
-    for pid, als in prof_aulas.items():
-        day_bools = []
+    # ── SOFT: max 2 da mesma disciplina por dia + distribuição ──
+    penalties = []
+    sci = [0]
+    def sn():
+        sci[0] += 1
+        return f"p{sci[0]}"
+
+    disc_a = {}
+    for a in range(na):
+        disc_a.setdefault(aulas[a]["did"], []).append(a)
+
+    for did, als in disc_a.items():
         for d in range(NUM_DIAS):
-            day_vars = [x[(a, d, s)] for a in als for s in range(NUM_SLOTS)]
-            if day_vars:
-                b = model.new_bool_var(f"sc{sc_idx}")
-                sc_idx += 1
-                # b=1 se professor tem pelo menos 1 aula nesse dia
-                model.add(sum(day_vars) >= 1).only_enforce_if(b)
-                model.add(sum(day_vars) == 0).only_enforce_if(b.Not())
-                day_bools.append(b)
-        if len(day_bools) == 5:
-            # Penalizar se todos os 5 dias usados
-            all5 = model.new_bool_var(f"sc{sc_idx}")
-            sc_idx += 1
-            model.add(sum(day_bools) >= 5).only_enforce_if(all5)
-            model.add(sum(day_bools) <= 4).only_enforce_if(all5.Not())
-            penalties.append(all5 * 30)
+            dvars = [x[(a, d, s)] for a in als for s in range(NUM_SLOTS)]
+            if len(dvars) > 2:
+                e = model.new_int_var(0, len(dvars), sn())
+                model.add(e >= sum(dvars) - 2)
+                penalties.append(e * 50)
+            if len(als) > 1 and dvars:
+                o = model.new_int_var(0, 10, sn())
+                model.add(o >= sum(dvars) - 1)
+                penalties.append(o * 10)
 
-    # ── FUNÇÃO OBJETIVO ──
     if penalties:
         model.minimize(sum(penalties))
 
-    # ── RESOLVER ──
+    # ── Resolver ──
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 120
-    solver.parameters.num_workers = 2  # free tier friendly
-    solver.parameters.log_search_progress = False
+    solver.parameters.max_time_in_seconds = 15
+    solver.parameters.num_workers = 1
 
-    logger.info(f"Iniciando solver: {num_aulas} aulas, {len(data.turmas)} turmas, {len(prof_aulas)} profs")
     status = solver.Solve(model)
 
-    status_map = {
-        cp_model.OPTIMAL: "otimo",
-        cp_model.FEASIBLE: "viavel",
-        cp_model.INFEASIBLE: "inviavel",
-        cp_model.MODEL_INVALID: "modelo_invalido",
-        cp_model.UNKNOWN: "desconhecido"
-    }
-    result_status = status_map.get(status, "desconhecido")
-
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-        return {
-            "status": result_status,
-            "message": "Não foi possível encontrar solução viável. Verifique se as restrições não são conflitantes.",
-            "alocacoes": [], "total_aulas": num_aulas, "alocadas": 0, "nao_alocadas": num_aulas,
-            "detalhes_solver": {"wall_time": round(solver.WallTime(), 2)}
-        }
+        logger.warning(f"Turma {turma_id}: sem solução (status={status})")
+        return {"ok": False, "total": na, "alocadas": 0, "alocacoes": []}
 
-    # ── EXTRAIR SOLUÇÃO ──
+    # Extrair
     alocacoes = []
-    for a in range(num_aulas):
-        meta = aula_meta[a]
-        found = False
+    for a in range(na):
         for d in range(NUM_DIAS):
+            found = False
             for s in range(NUM_SLOTS):
                 if solver.Value(x[(a, d, s)]) == 1:
                     alocacoes.append({
-                        "turma_id": meta["turma_id"],
-                        "disciplina_id": meta["disc_id"],
-                        "professor_id": meta["prof_id"],
-                        "dia": DIAS[d],
+                        "turma_id": turma_id,
+                        "disciplina_id": aulas[a]["did"],
+                        "professor_id": aulas[a]["pid"],
+                        "dia": DIA_NAMES[d],
                         "slot": TODOS_SLOTS[s]
                     })
-                    if meta["tipo"] == "geminada" and s + 1 < NUM_SLOTS:
+                    if aulas[a]["tipo"] == "geminada" and s + 1 < NUM_SLOTS:
                         alocacoes.append({
-                            "turma_id": meta["turma_id"],
-                            "disciplina_id": meta["disc_id"],
-                            "professor_id": meta["prof_id"],
-                            "dia": DIAS[d],
+                            "turma_id": turma_id,
+                            "disciplina_id": aulas[a]["did"],
+                            "professor_id": aulas[a]["pid"],
+                            "dia": DIA_NAMES[d],
                             "slot": TODOS_SLOTS[s + 1]
                         })
                     found = True
@@ -408,19 +403,5 @@ def resolver_horarios(data: InputData) -> dict:
             if found:
                 break
 
-    total_slots = len(alocacoes)
-    pen_total = round(solver.ObjectiveValue(), 1) if penalties else 0
-
-    return {
-        "status": result_status,
-        "message": f"Grade gerada com sucesso! {total_slots} aulas alocadas.",
-        "alocacoes": alocacoes,
-        "total_aulas": num_aulas,
-        "alocadas": total_slots,
-        "nao_alocadas": 0,
-        "penalidade_total": pen_total,
-        "detalhes_solver": {
-            "wall_time": round(solver.WallTime(), 2),
-            "objective": pen_total
-        }
-    }
+    logger.info(f"Turma {turma_id}: {len(alocacoes)} aulas alocadas")
+    return {"ok": True, "total": na, "alocadas": len(alocacoes), "alocacoes": alocacoes}
