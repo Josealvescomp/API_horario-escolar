@@ -10,8 +10,8 @@ Recebe dados via POST JSON, retorna a grade otimizada.
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
+from pydantic import BaseModel, field_validator
+from typing import Optional, Union
 from ortools.sat.python import cp_model
 import time
 import logging
@@ -43,7 +43,7 @@ class Professor(BaseModel):
 class Turma(BaseModel):
     id: str
     nome: str
-    serie: str
+    serie: str = ""
     turno: Optional[str] = "Integral"
 
 class Disciplina(BaseModel):
@@ -56,20 +56,30 @@ class CargaHoraria(BaseModel):
     turma_id: str
     disciplina_id: str
     professor_id: str
-    aulas_semana: int
-    geminada: Optional[str] = "NAO"  # "SIM" ou "NAO"
+    aulas_semana: Union[int, str]
+    geminada: Optional[str] = "NAO"
+
+    @field_validator('aulas_semana', mode='before')
+    @classmethod
+    def coerce_aulas(cls, v):
+        return int(v) if isinstance(v, str) else v
 
 class Indisponibilidade(BaseModel):
     professor_id: str
     dia: str
-    slot: int
+    slot: Union[int, str]
+
+    @field_validator('slot', mode='before')
+    @classmethod
+    def coerce_slot(cls, v):
+        return int(v) if isinstance(v, str) else v
 
 class InputData(BaseModel):
     professores: list[Professor]
     turmas: list[Turma]
     disciplinas: list[Disciplina]
     carga_horaria: list[CargaHoraria]
-    indisponibilidades: list[Indisponibilidade]  # apenas os bloqueios
+    indisponibilidades: list[Indisponibilidade]
     config: Optional[dict] = None
 
 # ──────────────────────────────────────────────
@@ -151,7 +161,7 @@ def resolver_horarios(data: InputData) -> dict:
 
     for ind in data.indisponibilidades:
         d_idx = dia_to_idx.get(ind.dia)
-        s_idx = slot_to_idx.get(ind.slot)
+        s_idx = slot_to_idx.get(int(ind.slot))
         if d_idx is not None and s_idx is not None:
             indisp_set.add((ind.professor_id, d_idx, s_idx))
 
