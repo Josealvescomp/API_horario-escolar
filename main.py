@@ -339,7 +339,7 @@ def resolver_turma(turma_id, cargas, indisp, prof_ocupado):
                 if len(occ) > 1:
                     model.add(sum(occ) <= 1)
 
-    # ── SOFT: max 2 da mesma disciplina por dia + distribuição ──
+    # ── SOFT: max 2 da mesma disciplina por dia + distribuição + janelas ──
     penalties = []
     sci = [0]
     def sn():
@@ -361,6 +361,40 @@ def resolver_turma(turma_id, cargas, indisp, prof_ocupado):
                 o = model.new_int_var(0, 10, sn())
                 model.add(o >= sum(dvars) - 1)
                 penalties.append(o * 10)
+
+    # SOFT: Minimizar janelas (slots vazios entre aulas) por turno
+    # Para cada dia e turno, penalizar se há um slot vazio entre dois ocupados
+    for d in range(NUM_DIAS):
+        for turno_range in [range(0, MANHA_LEN), range(MANHA_LEN, NUM_SLOTS)]:
+            slots = list(turno_range)
+            if len(slots) < 3:
+                continue
+            # slot_occ[s] = 1 se alguma aula ocupa slot s nesse dia
+            slot_occ = {}
+            for s in slots:
+                occ_vars = []
+                for a in range(na):
+                    occ_vars.append(x[(a, d, s)])
+                    if aulas[a]["tipo"] == "geminada" and s > 0:
+                        sp = s - 1
+                        same = (sp < MANHA_LEN and s < MANHA_LEN) or (sp >= MANHA_LEN and s >= MANHA_LEN)
+                        if same and sp in slots:
+                            occ_vars.append(x[(a, d, sp)])
+                so = model.new_bool_var(sn())
+                if occ_vars:
+                    model.add_max_equality(so, occ_vars)
+                else:
+                    model.add(so == 0)
+                slot_occ[s] = so
+
+            # Penalizar janelas: prev=1, curr=0, next=1
+            for i in range(1, len(slots) - 1):
+                sp, sc, sn_ = slots[i-1], slots[i], slots[i+1]
+                gap = model.new_bool_var(sn())
+                # gap=1 iff prev AND NOT curr AND next
+                model.add_bool_and([slot_occ[sp], slot_occ[sc].Not(), slot_occ[sn_]]).only_enforce_if(gap)
+                model.add_bool_or([slot_occ[sp].Not(), slot_occ[sc], slot_occ[sn_].Not()]).only_enforce_if(gap.Not())
+                penalties.append(gap * 20)
 
     if penalties:
         model.minimize(sum(penalties))
